@@ -12,14 +12,21 @@ import {
   RPCRequest,
   RPCResponse,
 } from "@/utils/scw-sdk/cipher";
+import { replacer } from "@/utils/scw-sdk/json";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { stringToHex } from "viem";
-import { replacer, reviver } from "../../utils/scw-sdk/json";
 
 const keyManager = new SCWKeyManager();
 
-async function encryptMessage({ id, content }: { id: string; content: any }) {
+async function encryptMessage({
+  id,
+  timestamp,
+  content,
+}: {
+  id: string;
+  timestamp: string;
+  content: any;
+}) {
   const secret = await keyManager.getSharedSecret();
 
   if (!secret) {
@@ -29,18 +36,13 @@ async function encryptMessage({ id, content }: { id: string; content: any }) {
   const encrypted = await encryptContent(content, secret);
 
   return {
+    id,
     requestId: id,
+    timestamp,
     sender: await exportKeyToHexString("public", await keyManager.getOwnPublicKey()),
     content: {
       encrypted,
     },
-  };
-}
-
-function sendPlaintextMessage({ id, content }: { id: string; content: any }) {
-  return {
-    requestId: id,
-    content: { plaintext: JSON.stringify(content) },
   };
 }
 
@@ -55,8 +57,12 @@ export default function Page() {
   const router = useRouter();
   const hasHandledMessage = useRef(false);
 
-  const message = params.get("message");
-  const callbackUrl = params.get("callbackUrl");
+  const id = JSON.parse(params.get("id") || "");
+  const sender = JSON.parse(params.get("sender") || "");
+  const sdkVersion = JSON.parse(params.get("sdkVersion") || "");
+  const callbackUrl = JSON.parse(params.get("callbackUrl") || "");
+  const timestamp = JSON.parse(params.get("timestamp") || "");
+  const content = JSON.parse(params.get("content") || "");
 
   const [messages, setMessages] = useState<string[]>([]);
 
@@ -69,29 +75,26 @@ export default function Page() {
 
   const handleMessage = useCallback(
     async (
-      rawMessage: string,
+      m: any,
     ): Promise<
       { requestId: string; sender?: string; content: any } | { requestId: string; data: string }
     > => {
-      const m = JSON.parse(rawMessage, reviver);
       let decrypted: RPCRequest | RPCResponse<unknown> | undefined;
-      if (m.data.content?.encrypted) {
+      if (m.content?.encrypted) {
         const secret = await keyManager.getSharedSecret();
         if (!secret) {
           throw new Error("Shared secret not derived");
         }
-        decrypted = await decryptContent(m.data.content.encrypted, secret);
-      } else if (m.data.content?.plaintext) {
-        decrypted = JSON.parse(m.data.content.plaintext);
+        decrypted = await decryptContent(m.content.encrypted, secret);
       }
 
       decrypted && addMessage(JSON.stringify(decrypted, null, 2));
 
-      if (m.data.event === "selectSignerType") {
-        const response = { requestId: m.data.id, data: "scw" };
+      if (m.event === "selectSignerType") {
+        const response = { requestId: m.id, data: "scw" };
         return response;
-      } else if (m.data.content?.handshake?.method === "eth_requestAccounts") {
-        const peerPublicKey = await importKeyFromHexString("public", m.data.sender);
+      } else if (m.content?.handshake?.method === "eth_requestAccounts") {
+        const peerPublicKey = await importKeyFromHexString("public", m.sender);
         await keyManager.setPeerPublicKey(peerPublicKey);
         const accountResult = await me.get();
 
@@ -108,7 +111,8 @@ export default function Page() {
         };
 
         return encryptMessage({
-          id: m.data.id,
+          id: m.id,
+          timestamp: m.timestamp,
           content: message,
         });
       } else if (decrypted && "action" in decrypted) {
@@ -127,8 +131,9 @@ export default function Page() {
         };
 
         return encryptMessage({
-          id: m.data.id,
+          id: m.id,
           content: message,
+          timestamp: m.timestamp,
         });
 
         // if (decrypted.action.method !== "eth_sendTransaction") {
@@ -142,22 +147,52 @@ export default function Page() {
   );
 
   useEffect(() => {
-    if (!message || !callbackUrl || !me.get || hasHandledMessage.current) {
+    if (!callbackUrl || !me.get || hasHandledMessage.current) {
       return;
+    }
+
+    const message = {
+      id,
+      sender,
+      sdkVersion,
+      timestamp,
+      content,
+    };
+
+    if ("encrypted" in message.content) {
+      const encrypted = message.content.encrypted;
+      message.content = {
+        encrypted: {
+          iv: new Uint8Array(Buffer.from(encrypted.iv, "hex")),
+          cipherText: new Uint8Array(Buffer.from(encrypted.cipherText, "hex")),
+        },
+      };
     }
 
     hasHandledMessage.current = true;
 
     handleMessage(message).then((response) => {
       const url = new URL(callbackUrl);
-      url.searchParams.set("message", JSON.stringify(response, replacer));
+
+      for (const [key, value] of Object.entries(response)) {
+        url.searchParams.set(key, JSON.stringify(value, replacer));
+      }
+
       router.push(url.toString());
     });
-  }, [me, message, callbackUrl]);
+  }, [me, callbackUrl]);
 
   return (
     <div>
-      <div>{message}</div>
+      <div>
+        {JSON.stringify({
+          id,
+          sender,
+          sdkVersion,
+          timestamp,
+          content,
+        })}
+      </div>
       <div>{callbackUrl}</div>
       {messages.map((message, index) => {
         return <div key={index}>{message}</div>;
